@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  smart-search-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smart-search-service
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - DATABASE_URL=/app/dev.db
+      - CORS_ORIGIN=http://localhost:3000
+    volumes:
+      - ../prisma/dev.db:/app/dev.db:ro
+    networks:
+      - portal-network
+    restart: unless-stopped
+
+networks:
+  portal-network:
+    driver: bridge
