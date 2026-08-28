@@ -6,6 +6,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 
 	_ "github.com/lib/pq"
 )
@@ -34,157 +35,284 @@ func apenasDigitos(s string) bool {
 	}
 	return true
 }
+// Colunas devolvidas ao chamador, na ordem em que o portal espera lê-las.
+//
+// Tudo sai como TEXT. O UNION exige o mesmo tipo em cada posição dos dois
+// lados, e os catálogos discordam: `produtos_carros.pro_codigo` é inteiro,
+// `products.pro_codigo` é texto (há código com letra no catálogo). TEXT é o
+// único acordo possível — e o consumidor já aceita os dois: `comoTexto`, no
+// smart-search.service.ts do back, coage número e string para o mesmo texto.
+const colunasResultado = `pro_codigo, pro_descricao, referencia,
+	carro_1, ano_1,
+	carro_2, ano_2,
+	carro_3, ano_3,
+	carro_4, ano_4,
+	carro_5, ano_5,
+	carro_6, ano_6,
+	carro_7, ano_7,
+	carro_8, ano_8,
+	carro_9, ano_9,
+	carro_10, ano_10,
+	status, origem`
 
-// Busca produtos por string concatenada nas colunas, ignorando nulos
+// Ordena código como número sem precisar convertê-lo: entre códigos de dígitos,
+// o mais curto vem antes e, no mesmo tamanho, a ordem textual já é a numérica.
+// Um CAST para inteiro estouraria nos códigos com letra, que caem no 99 e vão
+// para o fim da lista.
+const ordemPorCodigo = `CASE WHEN pro_codigo ~ '^[0-9]+$' THEN LENGTH(pro_codigo) ELSE 99 END,
+				pro_codigo ASC`
+
+/*
+   Busca nas DUAS tabelas, com `products` completando o que falta.
+
+   A `produtos_carros` é o catálogo com aplicação (carro/ano), mas está
+   incompleta: o código 177 (GRAMPO FORRO PORTA UNO) não existe nela, embora
+   exista em `products`. Buscar só nela é devolver "tudo menos o item" para
+   toda peça nessa situação.
+
+   O UNION resolve pelo código: quando a peça está nas duas vale a linha de
+   `produtos_carros`, a única que traz carro/ano; quando só existe em
+   `products`, ela entra com as colunas de aplicação nulas. A coluna `origem`
+   diz de qual tabela cada linha veio.
+
+   O DISTINCT ON é o desempate — ordenado por `prioridade_origem`, fica a linha
+   de `produtos_carros` (0) e some a de `products` (1). Ele mora num CTE
+   separado porque o DISTINCT ON obriga o ORDER BY a começar pelo pro_codigo,
+   que não é a ordem de relevância que o resultado precisa ter no fim.
+*/
+const consultaUnificada = `
+	WITH base AS (
+		SELECT
+			CAST(pc.pro_codigo AS TEXT) AS pro_codigo,
+			CAST(pc.pro_descricao AS TEXT) AS pro_descricao,
+			CAST(pc.referencia AS TEXT) AS referencia,
+			CAST(pc.carro_1 AS TEXT) AS carro_1, CAST(pc.ano_1 AS TEXT) AS ano_1,
+			CAST(pc.carro_2 AS TEXT) AS carro_2, CAST(pc.ano_2 AS TEXT) AS ano_2,
+			CAST(pc.carro_3 AS TEXT) AS carro_3, CAST(pc.ano_3 AS TEXT) AS ano_3,
+			CAST(pc.carro_4 AS TEXT) AS carro_4, CAST(pc.ano_4 AS TEXT) AS ano_4,
+			CAST(pc.carro_5 AS TEXT) AS carro_5, CAST(pc.ano_5 AS TEXT) AS ano_5,
+			CAST(pc.carro_6 AS TEXT) AS carro_6, CAST(pc.ano_6 AS TEXT) AS ano_6,
+			CAST(pc.carro_7 AS TEXT) AS carro_7, CAST(pc.ano_7 AS TEXT) AS ano_7,
+			CAST(pc.carro_8 AS TEXT) AS carro_8, CAST(pc.ano_8 AS TEXT) AS ano_8,
+			CAST(pc.carro_9 AS TEXT) AS carro_9, CAST(pc.ano_9 AS TEXT) AS ano_9,
+			CAST(pc.carro_10 AS TEXT) AS carro_10, CAST(pc.ano_10 AS TEXT) AS ano_10,
+			CAST(pc.status AS TEXT) AS status,
+			CAST('produtos_carros' AS TEXT) AS origem,
+			0 AS prioridade_origem
+		FROM public.produtos_carros pc
+		WHERE %s
+		UNION ALL
+		SELECT
+			CAST(p.pro_codigo AS TEXT) AS pro_codigo,
+			CAST(p.name AS TEXT) AS pro_descricao,
+			NULL::text AS referencia,
+			NULL::text AS carro_1, NULL::text AS ano_1,
+			NULL::text AS carro_2, NULL::text AS ano_2,
+			NULL::text AS carro_3, NULL::text AS ano_3,
+			NULL::text AS carro_4, NULL::text AS ano_4,
+			NULL::text AS carro_5, NULL::text AS ano_5,
+			NULL::text AS carro_6, NULL::text AS ano_6,
+			NULL::text AS carro_7, NULL::text AS ano_7,
+			NULL::text AS carro_8, NULL::text AS ano_8,
+			NULL::text AS carro_9, NULL::text AS ano_9,
+			NULL::text AS carro_10, NULL::text AS ano_10,
+			NULL::text AS status,
+			CAST('products' AS TEXT) AS origem,
+			1 AS prioridade_origem
+		FROM public.products p
+		WHERE p.active IS TRUE AND %s
+	),
+	unicos AS (
+		SELECT DISTINCT ON (pro_codigo) *
+		FROM base
+		ORDER BY pro_codigo, prioridade_origem
+	)
+	SELECT ` + colunasResultado + `
+	FROM unicos
+	ORDER BY %s
+	LIMIT $%d
+`
+
+/*
+   `nomeCelta` é coluna nova e pode não existir ainda em todo ambiente.
+
+   Referenciá-la direto quebraria a busca INTEIRA com "column does not exist"
+   onde a migração não passou — e o serviço não tem como distinguir isso de um
+   banco fora do ar. Por isso o catálogo é consultado uma vez no primeiro uso e
+   a coluna só entra no concat_ws onde realmente existe.
+
+   O nome vai entre aspas porque o Prisma cria coluna camelCase citada: sem as
+   aspas o Postgres procuraria `nomecelta`, tudo minúsculo, e não acharia.
+*/
+var (
+	deteccaoUmaVez     sync.Once
+	nomeCeltaEmCarros  bool
+	nomeCeltaEmProduct bool
+)
+
+func colunaExiste(db *sql.DB, tabela, coluna string) bool {
+	var existe bool
+	err := db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+		)`, tabela, coluna).Scan(&existe)
+	if err != nil {
+		log.Printf("[SCHEMA] não deu para checar %s.%s (%v) — coluna ignorada", tabela, coluna, err)
+		return false
+	}
+	return existe
+}
+
+func detectarColunas(db *sql.DB) {
+	deteccaoUmaVez.Do(func() {
+		nomeCeltaEmCarros = colunaExiste(db, "produtos_carros", "nomeCelta")
+		nomeCeltaEmProduct = colunaExiste(db, "products", "nomeCelta")
+		log.Printf("[SCHEMA] nomeCelta: produtos_carros=%v products=%v",
+			nomeCeltaEmCarros, nomeCeltaEmProduct)
+	})
+}
+
+// Busca produtos nas duas tabelas do catálogo, ignorando nulos
 func SearchProdutosCarros(db *sql.DB, search string, limit int) ([]map[string]interface{}, error) {
-	var query string
+	detectarColunas(db)
+
+	// Colunas que cada tabela expõe à busca textual.
+	colunasCarros := `pc.pro_codigo, pc.pro_descricao, pc.referencia,
+					pc.carro_1, pc.ano_1,
+					pc.carro_2, pc.ano_2,
+					pc.carro_3, pc.ano_3,
+					pc.carro_4, pc.ano_4,
+					pc.carro_5, pc.ano_5,
+					pc.carro_6, pc.ano_6,
+					pc.carro_7, pc.ano_7,
+					pc.carro_8, pc.ano_8,
+					pc.carro_9, pc.ano_9,
+					pc.carro_10, pc.ano_10`
+	if nomeCeltaEmCarros {
+		colunasCarros += `, pc."nomeCelta"`
+	}
+
+	// Em `products` a descrição é a coluna `name`; `brand` entra porque o
+	// comprador digita a marca junto com a peça.
+	colunasProducts := `p.pro_codigo, p.name, p.brand`
+	if nomeCeltaEmProduct {
+		colunasProducts += `, p."nomeCelta"`
+	}
+
 	var params []interface{}
+	paramIndex := 1
 
-	if strings.TrimSpace(search) == "" {
-		// Se não há termo de busca, retorna todos os registros
-		query = `
-			SELECT pro_codigo, pro_descricao, referencia,
-				carro_1, ano_1, carro_2, ano_2, carro_3, ano_3, carro_4, ano_4,
-				carro_5, ano_5, carro_6, ano_6, carro_7, ano_7, carro_8, ano_8,
-				carro_9, ano_9, carro_10, ano_10,
-				status
-			FROM public.produtos_carros
-			LIMIT $1
-		`
-		params = []interface{}{limit}
-	} else {
-		// Divide a busca em palavras para buscar cada termo
-		searchTerms := strings.Fields(strings.ToUpper(search))
+	// Sem termo de busca a consulta vira listagem: as condições passam a TRUE e
+	// o UNION devolve o catálogo inteiro, já deduplicado.
+	condCarros, condProducts := "TRUE", "TRUE"
 
-		// Constrói condições para cada termo
-		var conditions []string
-		paramIndex := 1
+	if termos := strings.Fields(strings.ToUpper(search)); len(termos) > 0 {
+		var filtrosCarros, filtrosProducts []string
 
-		for _, term := range searchTerms {
-			// concat_ws ignora NULLs e converte qualquer tipo de coluna (inclusive
-			// integer, como ano_*) para texto, evitando erro de cast no Postgres.
+		for _, termo := range termos {
+			// concat_ws ignora NULLs e converte qualquer tipo de coluna para
+			// texto, evitando erro de cast no Postgres. O pro_codigo aparece de
+			// novo, sozinho, no segundo LIKE: dentro do concat_ws ele fica
+			// colado no vizinho e casa pelo mesmo LIKE frouxo que casa qualquer
+			// ano; testá-lo à parte deixa o casamento por código explícito.
 			//
-			// O pro_codigo aparece de novo, sozinho, no segundo LIKE: dentro do
-			// concat_ws ele fica colado no vizinho (".. 31500 PARABRISA ..") e o
-			// código inteiro casa, mas é o mesmo LIKE frouxo que casa qualquer
-			// ano; testá-lo à parte deixa o casamento por código explícito e
-			// independente das outras colunas.
-			condition := fmt.Sprintf(`(
-				UPPER(concat_ws(' ',
-					pro_codigo, pro_descricao, referencia,
-					carro_1, ano_1, carro_2, ano_2, carro_3, ano_3, carro_4, ano_4,
-					carro_5, ano_5, carro_6, ano_6, carro_7, ano_7, carro_8, ano_8,
-					carro_9, ano_9, carro_10, ano_10)) LIKE $%d
-				OR UPPER(COALESCE(CAST(pro_codigo AS TEXT), '')) LIKE $%d)`, paramIndex, paramIndex)
+			// Os dois lados do UNION consomem o MESMO $n — é o mesmo termo.
+			filtrosCarros = append(filtrosCarros, fmt.Sprintf(
+				`(UPPER(concat_ws(' ', %s)) LIKE $%d
+				OR UPPER(COALESCE(CAST(pc.pro_codigo AS TEXT), '')) LIKE $%d)`,
+				colunasCarros, paramIndex, paramIndex))
 
-			conditions = append(conditions, condition)
-			params = append(params, "%"+strings.ToUpper(term)+"%")
+			filtrosProducts = append(filtrosProducts, fmt.Sprintf(
+				`(UPPER(concat_ws(' ', %s)) LIKE $%d
+				OR UPPER(COALESCE(CAST(p.pro_codigo AS TEXT), '')) LIKE $%d)`,
+				colunasProducts, paramIndex, paramIndex))
+
+			params = append(params, "%"+termo+"%")
 			paramIndex++
 		}
 
-		/*
-		   Relevância: o que o comprador digitou vem primeiro.
+		condCarros = strings.Join(filtrosCarros, " AND ")
+		condProducts = strings.Join(filtrosProducts, " AND ")
+	}
 
-		   Antes não havia ORDER BY nenhum — a ordem era a que o Postgres
-		   entregasse (ordem física da tabela). Buscando "p/brisa", um "COLA DE
-		   P/BRISA" podia encabeçar a lista à frente de "P/BRISA GOL", que é o
-		   que a pessoa procurava.
+	termoInteiro := strings.ToUpper(strings.TrimSpace(search))
+	ordenacao := ordemPorCodigo
 
-		   Três degraus, sobre a DESCRIÇÃO (é o que aparece na tela):
-		     0 — a descrição COMEÇA com o termo inteiro ("P/BRISA GOL")
-		     1 — a descrição CONTÉM o termo, mas não começa ("COLA DE P/BRISA")
-		     2 — casou por outra coluna: código, referência ou carro/ano
+	switch {
+	case termoInteiro == "":
+		// Listagem: ordem por código, estável entre chamadas, para o portal
+		// paginar sem linha trocando de página entre requisições.
 
-		   O termo usado aqui é a busca INTEIRA, não cada palavra: quem digita
-		   "p/brisa gol" quer o para-brisa do Gol no topo, e ranquear por palavra
-		   solta ("gol") jogaria qualquer peça de Gol para a frente.
-
-		   Dentro de cada degrau, ordem alfabética. O desempate final por
-		   pro_codigo existe para a ordem ser estável entre chamadas: duas peças
-		   com a mesma descrição sairiam em ordem imprevisível, e o portal pagina
-		   sobre esta lista — linha trocando de página entre requisições é
-		   resultado sumindo aos olhos de quem navega.
-		*/
-		termoInteiro := strings.ToUpper(strings.TrimSpace(search))
-
+	case apenasDigitos(termoInteiro):
 		/*
 		   Quem digita só números está digitando um código, não uma descrição.
 
 		   Nenhuma descrição começa por "31500", então o ranking por descrição
-		   acima empata TODOS os resultados no degrau 2 e a ordem volta a ser a
-		   que o Postgres entregar — o próprio código procurado podia sair no
-		   meio da lista, atrás de peças que casaram só pelo ano (ano_1 = 2015
-		   casa com quem buscou "2015" e também com quem buscou "15").
+		   empataria TODOS os resultados no último degrau e a ordem voltaria a
+		   ser a que o Postgres entregasse — o próprio código procurado saindo
+		   no meio da lista, atrás de peças que casaram só pelo ano.
 
-		   Para busca numérica o ranking passa a ser sobre o pro_codigo:
 		     0 — é exatamente o código digitado
 		     1 — o código COMEÇA com o que foi digitado
 		     2 — o código CONTÉM o que foi digitado
-		     3 — casou por outra coluna (descrição, referência, carro/ano)
-
-		   e o desempate é o próprio pro_codigo em ordem crescente, que é a
-		   ordem em que o comprador espera ler uma lista de códigos.
+		     3 — casou por outra coluna
 		*/
-		// Cada ramo registra só os parâmetros que o seu ORDER BY usa: um $n que
-		// o SQL nunca referencia deixa o Postgres sem como inferir o tipo e a
-		// query morre em "could not determine data type of parameter".
-		var ordenacao string
-		if apenasDigitos(termoInteiro) {
-			idxExato := paramIndex
-			params = append(params, termoInteiro)
-			paramIndex++
+		idxExato := paramIndex
+		params = append(params, termoInteiro)
+		paramIndex++
 
-			idxPrefixo := paramIndex
-			params = append(params, termoInteiro+"%")
-			paramIndex++
+		idxPrefixo := paramIndex
+		params = append(params, termoInteiro+"%")
+		paramIndex++
 
-			idxContem := paramIndex
-			params = append(params, "%"+termoInteiro+"%")
-			paramIndex++
+		idxContem := paramIndex
+		params = append(params, "%"+termoInteiro+"%")
+		paramIndex++
 
-			ordenacao = fmt.Sprintf(`
+		ordenacao = fmt.Sprintf(`
 				CASE
-					WHEN UPPER(COALESCE(CAST(pro_codigo AS TEXT), '')) = $%d THEN 0
-					WHEN UPPER(COALESCE(CAST(pro_codigo AS TEXT), '')) LIKE $%d THEN 1
-					WHEN UPPER(COALESCE(CAST(pro_codigo AS TEXT), '')) LIKE $%d THEN 2
+					WHEN UPPER(pro_codigo) = $%d THEN 0
+					WHEN UPPER(pro_codigo) LIKE $%d THEN 1
+					WHEN UPPER(pro_codigo) LIKE $%d THEN 2
 					ELSE 3
 				END,
-				pro_codigo ASC,
-				pro_descricao ASC`, idxExato, idxPrefixo, idxContem)
-		} else {
-			idxPrefixo := paramIndex
-			params = append(params, termoInteiro+"%")
-			paramIndex++
+				`+ordemPorCodigo, idxExato, idxPrefixo, idxContem)
 
-			idxContem := paramIndex
-			params = append(params, "%"+termoInteiro+"%")
-			paramIndex++
+	default:
+		/*
+		   Busca textual: o que o comprador digitou vem primeiro, medido sobre a
+		   DESCRIÇÃO, que é o que aparece na tela.
+		     0 — a descrição COMEÇA com o termo inteiro ("P/BRISA GOL")
+		     1 — a descrição CONTÉM o termo, mas não começa ("COLA DE P/BRISA")
+		     2 — casou por outra coluna: código, referência, marca ou carro/ano
 
-			ordenacao = fmt.Sprintf(`
+		   O termo aqui é a busca INTEIRA, não cada palavra: quem digita
+		   "p/brisa gol" quer o para-brisa do Gol no topo, e ranquear por palavra
+		   solta ("gol") jogaria qualquer peça de Gol para a frente.
+		*/
+		idxPrefixo := paramIndex
+		params = append(params, termoInteiro+"%")
+		paramIndex++
+
+		idxContem := paramIndex
+		params = append(params, "%"+termoInteiro+"%")
+		paramIndex++
+
+		ordenacao = fmt.Sprintf(`
 				CASE
 					WHEN UPPER(COALESCE(pro_descricao, '')) LIKE $%d THEN 0
 					WHEN UPPER(COALESCE(pro_descricao, '')) LIKE $%d THEN 1
 					ELSE 2
 				END,
 				pro_descricao ASC,
-				pro_codigo ASC`, idxPrefixo, idxContem)
-		}
-
-		idxLimite := paramIndex
-		params = append(params, limit)
-
-		query = fmt.Sprintf(`
-			SELECT pro_codigo, pro_descricao, referencia,
-				carro_1, ano_1, carro_2, ano_2, carro_3, ano_3, carro_4, ano_4,
-				carro_5, ano_5, carro_6, ano_6, carro_7, ano_7, carro_8, ano_8,
-				carro_9, ano_9, carro_10, ano_10,
-				status
-			FROM public.produtos_carros
-			WHERE %s
-			ORDER BY %s
-			LIMIT $%d
-		`, strings.Join(conditions, " AND "), ordenacao, idxLimite)
+				`+ordemPorCodigo, idxPrefixo, idxContem)
 	}
+
+	idxLimite := paramIndex
+	params = append(params, limit)
+
+	query := fmt.Sprintf(consultaUnificada, condCarros, condProducts, ordenacao, idxLimite)
 
 	rows, err := db.Query(query, params...)
 	if err != nil {
