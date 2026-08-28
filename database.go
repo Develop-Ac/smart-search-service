@@ -19,6 +19,22 @@ type Product struct {
 	Active    bool
 }
 
+// apenasDigitos diz se a busca é um código, e não texto: só dígitos, nada de
+// letra, espaço ou traço. Serve para decidir o ranking — quem digita "31500"
+// quer o produto 31500, quem digita "gol 2015" quer para-brisa de Gol.
+func apenasDigitos(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // Busca produtos por string concatenada nas colunas, ignorando nulos
 func SearchProdutosCarros(db *sql.DB, search string, limit int) ([]map[string]interface{}, error) {
 	var query string
@@ -47,12 +63,19 @@ func SearchProdutosCarros(db *sql.DB, search string, limit int) ([]map[string]in
 		for _, term := range searchTerms {
 			// concat_ws ignora NULLs e converte qualquer tipo de coluna (inclusive
 			// integer, como ano_*) para texto, evitando erro de cast no Postgres.
+			//
+			// O pro_codigo aparece de novo, sozinho, no segundo LIKE: dentro do
+			// concat_ws ele fica colado no vizinho (".. 31500 PARABRISA ..") e o
+			// código inteiro casa, mas é o mesmo LIKE frouxo que casa qualquer
+			// ano; testá-lo à parte deixa o casamento por código explícito e
+			// independente das outras colunas.
 			condition := fmt.Sprintf(`(
 				UPPER(concat_ws(' ',
 					pro_codigo, pro_descricao, referencia,
 					carro_1, ano_1, carro_2, ano_2, carro_3, ano_3, carro_4, ano_4,
 					carro_5, ano_5, carro_6, ano_6, carro_7, ano_7, carro_8, ano_8,
-					carro_9, ano_9, carro_10, ano_10)) LIKE $%d)`, paramIndex)
+					carro_9, ano_9, carro_10, ano_10)) LIKE $%d
+				OR UPPER(COALESCE(CAST(pro_codigo AS TEXT), '')) LIKE $%d)`, paramIndex, paramIndex)
 
 			conditions = append(conditions, condition)
 			params = append(params, "%"+strings.ToUpper(term)+"%")
@@ -84,13 +107,68 @@ func SearchProdutosCarros(db *sql.DB, search string, limit int) ([]map[string]in
 		*/
 		termoInteiro := strings.ToUpper(strings.TrimSpace(search))
 
-		idxPrefixo := paramIndex
-		params = append(params, termoInteiro+"%")
-		paramIndex++
+		/*
+		   Quem digita só números está digitando um código, não uma descrição.
 
-		idxContem := paramIndex
-		params = append(params, "%"+termoInteiro+"%")
-		paramIndex++
+		   Nenhuma descrição começa por "31500", então o ranking por descrição
+		   acima empata TODOS os resultados no degrau 2 e a ordem volta a ser a
+		   que o Postgres entregar — o próprio código procurado podia sair no
+		   meio da lista, atrás de peças que casaram só pelo ano (ano_1 = 2015
+		   casa com quem buscou "2015" e também com quem buscou "15").
+
+		   Para busca numérica o ranking passa a ser sobre o pro_codigo:
+		     0 — é exatamente o código digitado
+		     1 — o código COMEÇA com o que foi digitado
+		     2 — o código CONTÉM o que foi digitado
+		     3 — casou por outra coluna (descrição, referência, carro/ano)
+
+		   e o desempate é o próprio pro_codigo em ordem crescente, que é a
+		   ordem em que o comprador espera ler uma lista de códigos.
+		*/
+		// Cada ramo registra só os parâmetros que o seu ORDER BY usa: um $n que
+		// o SQL nunca referencia deixa o Postgres sem como inferir o tipo e a
+		// query morre em "could not determine data type of parameter".
+		var ordenacao string
+		if apenasDigitos(termoInteiro) {
+			idxExato := paramIndex
+			params = append(params, termoInteiro)
+			paramIndex++
+
+			idxPrefixo := paramIndex
+			params = append(params, termoInteiro+"%")
+			paramIndex++
+
+			idxContem := paramIndex
+			params = append(params, "%"+termoInteiro+"%")
+			paramIndex++
+
+			ordenacao = fmt.Sprintf(`
+				CASE
+					WHEN UPPER(COALESCE(CAST(pro_codigo AS TEXT), '')) = $%d THEN 0
+					WHEN UPPER(COALESCE(CAST(pro_codigo AS TEXT), '')) LIKE $%d THEN 1
+					WHEN UPPER(COALESCE(CAST(pro_codigo AS TEXT), '')) LIKE $%d THEN 2
+					ELSE 3
+				END,
+				pro_codigo ASC,
+				pro_descricao ASC`, idxExato, idxPrefixo, idxContem)
+		} else {
+			idxPrefixo := paramIndex
+			params = append(params, termoInteiro+"%")
+			paramIndex++
+
+			idxContem := paramIndex
+			params = append(params, "%"+termoInteiro+"%")
+			paramIndex++
+
+			ordenacao = fmt.Sprintf(`
+				CASE
+					WHEN UPPER(COALESCE(pro_descricao, '')) LIKE $%d THEN 0
+					WHEN UPPER(COALESCE(pro_descricao, '')) LIKE $%d THEN 1
+					ELSE 2
+				END,
+				pro_descricao ASC,
+				pro_codigo ASC`, idxPrefixo, idxContem)
+		}
 
 		idxLimite := paramIndex
 		params = append(params, limit)
@@ -103,16 +181,9 @@ func SearchProdutosCarros(db *sql.DB, search string, limit int) ([]map[string]in
 				status
 			FROM public.produtos_carros
 			WHERE %s
-			ORDER BY
-				CASE
-					WHEN UPPER(COALESCE(pro_descricao, '')) LIKE $%d THEN 0
-					WHEN UPPER(COALESCE(pro_descricao, '')) LIKE $%d THEN 1
-					ELSE 2
-				END,
-				pro_descricao ASC,
-				pro_codigo ASC
+			ORDER BY %s
 			LIMIT $%d
-		`, strings.Join(conditions, " AND "), idxPrefixo, idxContem, idxLimite)
+		`, strings.Join(conditions, " AND "), ordenacao, idxLimite)
 	}
 
 	rows, err := db.Query(query, params...)
@@ -205,6 +276,24 @@ func SearchProductsFuzzy(db *sql.DB, query string, limit int) ([]map[string]inte
 	// Se não há termo de busca, retorna todos os registros
 	if strings.TrimSpace(query) == "" {
 		return SearchProdutosCarros(db, "", limit)
+	}
+
+	/*
+	   Código digitado não passa pelo fuzzy.
+
+	   O fuzzy pontua contra a DESCRIÇÃO, e busca por código não sobrevive a
+	   isso duas vezes: os candidatos vêm de um SELECT sem WHERE (as primeiras
+	   limit*10 linhas da tabela), então o produto 31500 provavelmente nem entra
+	   na lista; e mesmo entrando, "31500" contra "P/BRISA GOL" é distância de
+	   edição pura — o código certo ficaria abaixo de descrições que só têm
+	   dígitos parecidos.
+
+	   Busca numérica vai pelo SQL, que filtra a tabela inteira e já entrega
+	   ordenado pelo pro_codigo encontrado.
+	*/
+	if apenasDigitos(query) {
+		log.Printf("[FUZZY] Query '%s' é numérica: usando busca SQL por pro_codigo", query)
+		return SearchProdutosCarros(db, query, limit)
 	}
 
 	log.Printf("[FUZZY] Starting search for query: '%s', limit: %d", query, limit)
