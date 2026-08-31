@@ -42,7 +42,7 @@ func apenasDigitos(s string) bool {
 // `products.pro_codigo` é texto (há código com letra no catálogo). TEXT é o
 // único acordo possível — e o consumidor já aceita os dois: `comoTexto`, no
 // smart-search.service.ts do back, coage número e string para o mesmo texto.
-const colunasResultado = `pro_codigo, pro_descricao, referencia,
+const colunasResultado = `pro_codigo, pro_descricao, referencia, brand,
 	carro_1, ano_1,
 	carro_2, ano_2,
 	carro_3, ano_3,
@@ -86,6 +86,15 @@ const consultaUnificada = `
 			CAST(pc.pro_codigo AS TEXT) AS pro_codigo,
 			CAST(pc.pro_descricao AS TEXT) AS pro_descricao,
 			CAST(pc.referencia AS TEXT) AS referencia,
+			-- brand só existe em products. Como o DISTINCT ON prefere a linha de
+			-- produtos_carros (prioridade 0), buscar a marca aqui pelo pro_codigo
+			-- é o que impede a coluna de sair nula para toda peça que está nos
+			-- dois catálogos. Subconsulta, e não JOIN: código repetido em
+			-- products multiplicaria a linha antes da deduplicação.
+			(SELECT CAST(pb.brand AS TEXT)
+			 FROM public.products pb
+			 WHERE pb.pro_codigo = CAST(pc.pro_codigo AS TEXT)
+			 LIMIT 1) AS brand,
 			CAST(pc.carro_1 AS TEXT) AS carro_1, CAST(pc.ano_1 AS TEXT) AS ano_1,
 			CAST(pc.carro_2 AS TEXT) AS carro_2, CAST(pc.ano_2 AS TEXT) AS ano_2,
 			CAST(pc.carro_3 AS TEXT) AS carro_3, CAST(pc.ano_3 AS TEXT) AS ano_3,
@@ -106,6 +115,7 @@ const consultaUnificada = `
 			CAST(p.pro_codigo AS TEXT) AS pro_codigo,
 			CAST(p.name AS TEXT) AS pro_descricao,
 			NULL::text AS referencia,
+			CAST(p.brand AS TEXT) AS brand,
 			NULL::text AS carro_1, NULL::text AS ano_1,
 			NULL::text AS carro_2, NULL::text AS ano_2,
 			NULL::text AS carro_3, NULL::text AS ano_3,
