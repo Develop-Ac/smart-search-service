@@ -152,6 +152,30 @@ func TestPrefixoComDoisSentidosNaoFunde(t *testing.T) {
 	}
 }
 
+/*
+   Linha de espaçamento na planilha ("/GOL" → "/ GOL") não pode roubar a
+   palavra: quem digita "gol" tem que procurar "GOL", não só "/GOL". Foi o
+   que zerou "parabrisa gol" + categoria no portal.
+*/
+func TestPalavraDigitadaEntraSempreComoForma(t *testing.T) {
+	d := NovoDicionario([][2]string{
+		{"/GOL", "/ GOL"},
+		{"G5/G6", "G5 / G6"},
+		{"P/BRISA", "PARA-BRISA"},
+	})
+
+	if got := d.Interpretar("gol")[0].Formas; !reflect.DeepEqual(got, []string{"GOL"}) {
+		t.Errorf("formas de GOL = %v, esperado [GOL]", got)
+	}
+	// Com barra, as duas grafias servem.
+	if got := d.Interpretar("fox/gol")[0].Formas; !contem(got, "FOX/GOL") {
+		t.Errorf("FOX/GOL digitado deveria estar nas formas: %v", got)
+	}
+	if got := d.Interpretar("g5/g6")[0].Formas; !contem(got, "G5/G6") || !contem(got, "G5 / G6") {
+		t.Errorf("G5/G6 deveria procurar as duas grafias: %v", got)
+	}
+}
+
 func TestRepresentanteEhAChaveMaisFrequente(t *testing.T) {
 	d := dicionarioDeTeste()
 	// "DINATEIRO" (uma linha, erro de digitação) não pode virar o nome do

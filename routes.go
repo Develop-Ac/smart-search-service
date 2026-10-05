@@ -14,6 +14,13 @@ import (
 type SearchRequest struct {
 	Query string `json:"query" binding:"required"`
 	Limit int    `json:"limit"`
+	// Recortes do portal, aplicados antes do limite (ver `Filtros`).
+	Categoria string `json:"categoria"`
+	Marca     string `json:"marca"`
+}
+
+func (r SearchRequest) filtros() Filtros {
+	return Filtros{CategoriaID: strings.TrimSpace(r.Categoria), Marca: strings.TrimSpace(r.Marca)}
 }
 
 func setupRoutes(router *gin.Engine, db *sql.DB, searchMode string) {
@@ -36,8 +43,10 @@ func setupRoutes(router *gin.Engine, db *sql.DB, searchMode string) {
 		}
 
 		req := SearchRequest{
-			Query: query,
-			Limit: 50,
+			Query:     query,
+			Limit:     50,
+			Categoria: c.Query("categoria"),
+			Marca:     c.Query("marca"),
 		}
 
 		if limitStr := c.Query("limit"); limitStr != "" {
@@ -181,7 +190,7 @@ func handleSearch(c *gin.Context, db *sql.DB) {
 
 func performSearch(c *gin.Context, db *sql.DB, req SearchRequest) {
 	// Busca usando a mesma função SearchProducts que agora retorna map
-	results, err := SearchProducts(db, req.Query, req.Limit)
+	results, err := SearchProducts(db, req.Query, req.Limit, req.filtros())
 	if err != nil {
 		log.Printf("[ERROR] SearchProducts failed: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Erro ao buscar produtos: %v", err)})

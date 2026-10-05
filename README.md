@@ -103,6 +103,21 @@ Resposta:
 GET /api/search?q=parabrisa&limit=50
 ```
 
+Recortes opcionais, aplicados **antes** do `limit` (no POST, campos `categoria`
+e `marca` do corpo):
+
+| Parâmetro   | O que faz                                                        |
+|-------------|------------------------------------------------------------------|
+| `categoria` | id de `products."categoryId"`; em `produtos_carros`, pelo código |
+| `marca`     | trecho da marca, sem distinguir caixa                            |
+
+```bash
+GET /api/search?q=palio&limit=500&categoria=<id-da-categoria>
+```
+
+Sem isso, "PALIO" + categoria P/BRISA devolvia zero no portal: os 500 melhores
+para "PALIO" eram outras peças, e o filtro vinha depois do corte.
+
 ### Listar Todos os Produtos
 
 ```bash

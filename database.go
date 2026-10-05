@@ -215,8 +215,34 @@ func formaCurta(forma string) bool {
 	return len(forma) <= 3
 }
 
+/*
+   Filtros são recortes do portal aplicados ANTES do LIMIT.
+
+   Sem eles, "PALIO" + categoria P/BRISA devolvia zero no portal: o Go
+   mandava os 500 melhores para "PALIO" (tapete, maçaneta, retrovisor…), o
+   portal filtrava a categoria em memória e não sobrava para-brisa nenhum —
+   embora existam dezenas. O recorte tem que acontecer aqui, dentro da mesma
+   consulta, para o teto cortar só o que o comprador vai ver.
+
+   A categoria mora em `products."categoryId"` (coluna camelCase citada, como
+   o Prisma cria). `produtos_carros` não tem categoria nem marca: o recorte
+   nela é "o código existe em `products` com essa categoria/marca".
+*/
+type Filtros struct {
+	CategoriaID string // `products."categoryId"`, igualdade
+	Marca       string // trecho da marca, sem distinguir caixa
+}
+
+func (f Filtros) vazio() bool {
+	return f.CategoriaID == "" && f.Marca == ""
+}
+
 // Busca produtos nas duas tabelas do catálogo, ignorando nulos
 func SearchProdutosCarros(db *sql.DB, search string, limit int) ([]map[string]interface{}, error) {
+	return SearchProdutosCarrosComFiltros(db, search, limit, Filtros{})
+}
+
+func SearchProdutosCarrosComFiltros(db *sql.DB, search string, limit int, filtros Filtros) ([]map[string]interface{}, error) {
 	detectarColunas(db)
 
 	// Colunas que cada tabela expõe à busca textual.
@@ -262,8 +288,14 @@ func SearchProdutosCarros(db *sql.DB, search string, limit int) ([]map[string]in
 	contemPorGrupo := make([][]condicaoDeForma, len(grupos))
 
 	// Registra o parâmetro de uma forma e devolve a condição que o usa.
-	registrar := func(forma string, prefixo bool) condicaoDeForma {
-		c := condicaoDeForma{idx: paramIndex, palavraInteira: formaCurta(forma)}
+	//
+	// `digitada`: a forma é a própria palavra que o comprador escreveu. Essa
+	// nunca vira casamento de palavra inteira, por mais curta que seja — quem
+	// digita "gol" sempre encontrou GOLF, e "sen" encontra SENSOR. O recorte
+	// por palavra inteira é só para forma curta vinda do dicionário ("LE",
+	// "DT"), que o comprador não escolheu.
+	registrar := func(forma string, prefixo, digitada bool) condicaoDeForma {
+		c := condicaoDeForma{idx: paramIndex, palavraInteira: formaCurta(forma) && !digitada}
 		switch {
 		case c.palavraInteira && prefixo:
 			params = append(params, `^`+regexp.QuoteMeta(forma)+`\M`)
@@ -289,7 +321,7 @@ func SearchProdutosCarros(db *sql.DB, search string, limit int) ([]map[string]in
 				// para texto, evitando erro de cast no Postgres.
 				//
 				// Os dois lados do UNION consomem o MESMO $n — é a mesma forma.
-				c := registrar(forma, false)
+				c := registrar(forma, false, forma == grupo.Original)
 				ouCarros = append(ouCarros,
 					c.sql(fmt.Sprintf(`UPPER(concat_ws(' ', %s))`, colunasCarros)))
 				ouProducts = append(ouProducts,
@@ -315,6 +347,28 @@ func SearchProdutosCarros(db *sql.DB, search string, limit int) ([]map[string]in
 
 		condCarros = strings.Join(filtrosCarros, " AND ")
 		condProducts = strings.Join(filtrosProducts, " AND ")
+	}
+
+	if !filtros.vazio() {
+		// Mesmos $n nos dois lados: em `products` direto na linha, em
+		// `produtos_carros` pelo código, via subconsulta em `products`.
+		var emProducts, emSub []string
+		if filtros.CategoriaID != "" {
+			emProducts = append(emProducts, fmt.Sprintf(`p."categoryId" = $%d`, paramIndex))
+			emSub = append(emSub, fmt.Sprintf(`pb."categoryId" = $%d`, paramIndex))
+			params = append(params, filtros.CategoriaID)
+			paramIndex++
+		}
+		if filtros.Marca != "" {
+			emProducts = append(emProducts, fmt.Sprintf(`UPPER(COALESCE(p.brand, '')) LIKE $%d`, paramIndex))
+			emSub = append(emSub, fmt.Sprintf(`UPPER(COALESCE(pb.brand, '')) LIKE $%d`, paramIndex))
+			params = append(params, "%"+strings.ToUpper(strings.TrimSpace(filtros.Marca))+"%")
+			paramIndex++
+		}
+		condProducts = fmt.Sprintf(`(%s) AND %s`, condProducts, strings.Join(emProducts, " AND "))
+		condCarros = fmt.Sprintf(`(%s) AND CAST(pc.pro_codigo AS TEXT) IN (
+				SELECT pb.pro_codigo FROM public.products pb
+				WHERE pb.active IS TRUE AND %s)`, condCarros, strings.Join(emSub, " AND "))
 	}
 
 	termoInteiro := strings.ToUpper(strings.TrimSpace(search))
@@ -383,7 +437,8 @@ func SearchProdutosCarros(db *sql.DB, search string, limit int) ([]map[string]in
 
 		var comecaPrimeira []string
 		for _, forma := range grupos[0].Formas {
-			comecaPrimeira = append(comecaPrimeira, registrar(forma, true).sql(descricao))
+			comecaPrimeira = append(comecaPrimeira,
+				registrar(forma, true, forma == grupos[0].Original).sql(descricao))
 		}
 
 		// `%forma%` já está nos parâmetros do WHERE: reaproveita os índices.
@@ -502,9 +557,9 @@ func GetProducts(db *sql.DB, limit int) ([]map[string]interface{}, error) {
 	return SearchProdutosCarros(db, "", limit)
 }
 
-func SearchProducts(db *sql.DB, query string, limit int) ([]map[string]interface{}, error) {
+func SearchProducts(db *sql.DB, query string, limit int, filtros Filtros) ([]map[string]interface{}, error) {
 	// Usa SearchProdutosCarros com o filtro
-	return SearchProdutosCarros(db, query, limit)
+	return SearchProdutosCarrosComFiltros(db, query, limit, filtros)
 }
 
 // SearchProductsFuzzy executa busca com fuzzy matching

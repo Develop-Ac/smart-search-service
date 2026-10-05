@@ -407,8 +407,18 @@ func (d *Dicionario) resolver(palavra string) (string, bool) {
 }
 
 func (d *Dicionario) grupo(original, chave string) Grupo {
-	formas := make([]string, len(d.formas[chave]))
-	copy(formas, d.formas[chave])
+	formas := make([]string, 0, len(d.formas[chave])+1)
+	formas = append(formas, d.formas[chave]...)
+	/*
+	   A palavra como foi digitada entra SEMPRE como forma.
+
+	   A planilha tem linhas que só arrumam espaçamento: "/GOL" → "/ GOL",
+	   "G5/G6" → "G5 / G6". Compactadas, viram a chave "GOL" — e quem digita
+	   "gol" cai nesse grupo, cujas formas são só "/GOL" e "/ GOL". Sem esta
+	   linha, "parabrisa gol" procurava "/GOL" e nunca achava "P/BRISA GOL".
+	   A poda cuida do resto: "GOL" é mais curta e engole as outras duas.
+	*/
+	formas = podar(append(formas, normalizarTermo(original)))
 	return Grupo{
 		Original: original,
 		Chave:    chave,
