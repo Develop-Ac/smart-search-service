@@ -154,6 +154,46 @@ curl -X POST http://localhost:8080/api/search \
 4. **Ordenação**: Ordena por score, depois por startsWithQuery, depois por containsQuery
 5. **Filtragem**: Remove resultados abaixo do threshold (2.0)
 
+## 🔤 Abreviações (`Abreviações.xlsx`)
+
+O cadastro escreve `P/BRISA`, `P/CHOQUE`, `DIANT.`, `C/DESEMB`; o comprador
+digita `parabrisa`, `para-brisa`, `para choque`, `dianteiro`. A planilha
+`Abreviações.xlsx` (colunas **Prefixo** → **Termo**) ensina o serviço a ler as
+duas coisas como a mesma palavra. Ela é carregada no arranque
+(`ABREVIACOES_PATH`, padrão `Abreviações.xlsx`); sem o arquivo, o serviço sobe
+com um dicionário embutido mínimo e avisa no log.
+
+O que a busca passa a entender (ver `abreviacoes.go`):
+
+| Digitado           | Entendido como            | Procura no banco por                          |
+|--------------------|---------------------------|-----------------------------------------------|
+| `p/brisa gol`      | PARA-BRISA + GOL          | `P/BRISA`, `PARABRISA`, `PARA-BRISA`, `PARA BRISA` + `GOL` |
+| `parabrisa`        | PARA-BRISA                | idem                                          |
+| `para brisa`       | PARA-BRISA (uma palavra)  | idem                                          |
+| `parabrisagol`     | PARA-BRISA + GOL (colada) | idem                                          |
+| `diant.p/lama`     | DIANTEIRO + PARALAMA      | `DIANT`, `DT`, … + `P/LAMA`, `PARALAMA`, …    |
+| `dianteiros`       | DIANTEIRO (plural)        | `DIANT`, `DT`, `DIANTEIRO`, …                 |
+
+- Entre palavras é **E** (todas precisam casar); dentro de uma palavra é **OU**
+  (qualquer grafia serve).
+- Formas de até 3 letras (`LE`, `DT`, `C/`) só casam palavra inteira — num
+  `LIKE` solto, `LE` casaria LENTE, VOLANTE, PALHETA.
+- A planilha é mantida à mão e tem o mesmo prefixo com grafias diferentes do
+  termo (`PARA BRISA` / `PARA-BRISA`), erros de digitação (`DINATEIRO`) e
+  acentos perdidos. O carregador funde esses casos num grupo só; prefixos com
+  dois sentidos de verdade (`PTA` = PRETA e PORTA) ficam separados, e vale a
+  primeira linha.
+- No modo `fuzzy`, busca e descrição são traduzidas para o mesmo vocabulário
+  antes do Levenshtein — a abreviação deixa de contar como erro de digitação.
+
+Para conferir como uma busca foi lida, sem olhar produto:
+
+```bash
+curl "http://localhost:8080/api/interpretar?q=p/brisa%20gol"
+```
+
+Testes do dicionário: `go test ./...` (`abreviacoes_test.go`).
+
 ## 🔗 Integração com Frontend (Next.js)
 
 Exemplo de chamada no React/Next.js:

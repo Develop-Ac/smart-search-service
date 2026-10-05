@@ -19,27 +19,21 @@ type SearchResult struct {
 
 const MINIMUM_SCORE_THRESHOLD = 20
 
-// Normaliza texto para comparação
+/*
+   Normaliza texto para comparação: caixa alta, sem acento, e cada palavra
+   traduzida para o vocabulário do dicionário de abreviações.
+
+   Antes era um `ReplaceAll` fixo de "PARA BRISA" → "P/BRISA". Agora a
+   tradução vem da planilha (ver `abreviacoes.go`): "P/BRISA", "PARABRISA" e
+   "PARA-BRISA" viram todos "PARABRISA", "DIANT." e "DIANTEIRO" viram
+   "DIANTEIRO". Busca e descrição passam pelo MESMO funil, então a abreviação
+   do cadastro deixa de contar como erro de digitação no Levenshtein.
+*/
 func normalize(text string) string {
 	if text == "" {
 		return ""
 	}
-
-	// Converte para maiúscula
-	normalized := strings.ToUpper(text)
-
-	// Normalizações específicas para português
-	normalized = strings.ReplaceAll(normalized, "PARA BRISA", "P/BRISA")
-	normalized = strings.ReplaceAll(normalized, "PARA-BRISA", "P/BRISA")
-	normalized = strings.ReplaceAll(normalized, "PARABRISA", "P/BRISA")
-
-	// Remove espaços múltiplos
-	normalized = strings.Join(strings.Fields(normalized), " ")
-
-	// Remove acentos
-	normalized = removeAccents(normalized)
-
-	return strings.TrimSpace(normalized)
+	return dicionario.Canonizar(text)
 }
 
 // Remove acentos de uma string

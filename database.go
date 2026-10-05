@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -183,6 +184,37 @@ func detectarColunas(db *sql.DB) {
 	})
 }
 
+/*
+   condicaoDeForma é uma forma do dicionário já registrada como parâmetro,
+   pronta para virar `expr LIKE $n` — ou, para forma curta, `expr ~ $n` com
+   casamento de palavra inteira.
+
+   "LE" (lado esquerdo), "DT" (dianteiro), "C/" (com) têm duas letras: num
+   `LIKE '%LE%'` casariam LENTE, VOLANTE, PALHETA — metade do catálogo. Com
+   `\m` e `\M` (início e fim de palavra no regex do Postgres) "LE" só casa o
+   "LE" de "TRAS.LE" e "LD/LE", que é o que o cadastro escreve. O padrão
+   inteiro vai no parâmetro, montado em Go: a forma escapada
+   (`regexp.QuoteMeta` — "C." tem ponto, que é curinga) entre as âncoras.
+   Nada de `'\m' || $n` no SQL, cujo sentido dependeria de
+   `standard_conforming_strings`.
+*/
+type condicaoDeForma struct {
+	idx            int
+	palavraInteira bool // forma curta: só palavra inteira (regex)
+}
+
+func (c condicaoDeForma) sql(expr string) string {
+	if c.palavraInteira {
+		return fmt.Sprintf(`%s ~ $%d`, expr, c.idx)
+	}
+	return fmt.Sprintf(`%s LIKE $%d`, expr, c.idx)
+}
+
+// Até três caracteres: curta demais para um LIKE frouxo.
+func formaCurta(forma string) bool {
+	return len(forma) <= 3
+}
+
 // Busca produtos nas duas tabelas do catálogo, ignorando nulos
 func SearchProdutosCarros(db *sql.DB, search string, limit int) ([]map[string]interface{}, error) {
 	detectarColunas(db)
@@ -217,29 +249,68 @@ func SearchProdutosCarros(db *sql.DB, search string, limit int) ([]map[string]in
 	// o UNION devolve o catálogo inteiro, já deduplicado.
 	condCarros, condProducts := "TRUE", "TRUE"
 
-	if termos := strings.Fields(strings.ToUpper(search)); len(termos) > 0 {
+	/*
+	   Cada palavra digitada vira um GRUPO de formas (ver `abreviacoes.go`):
+	   "parabrisa" procura P/BRISA, PARABRISA, PARA-BRISA e PARA BRISA, porque
+	   o cadastro escreve de todos esses jeitos. Entre grupos é AND (todas as
+	   palavras precisam casar); dentro do grupo é OR (qualquer grafia serve).
+
+	   `contemPorGrupo[i]` guarda, para cada grupo, os índices dos parâmetros
+	   `%forma%` — a ordenação lá embaixo reutiliza os mesmos, sem repetir.
+	*/
+	grupos := dicionario.Interpretar(search)
+	contemPorGrupo := make([][]condicaoDeForma, len(grupos))
+
+	// Registra o parâmetro de uma forma e devolve a condição que o usa.
+	registrar := func(forma string, prefixo bool) condicaoDeForma {
+		c := condicaoDeForma{idx: paramIndex, palavraInteira: formaCurta(forma)}
+		switch {
+		case c.palavraInteira && prefixo:
+			params = append(params, `^`+regexp.QuoteMeta(forma)+`\M`)
+		case c.palavraInteira:
+			params = append(params, `\m`+regexp.QuoteMeta(forma)+`\M`)
+		case prefixo:
+			params = append(params, forma+"%")
+		default:
+			params = append(params, "%"+forma+"%")
+		}
+		paramIndex++
+		return c
+	}
+
+	if len(grupos) > 0 {
 		var filtrosCarros, filtrosProducts []string
 
-		for _, termo := range termos {
-			// concat_ws ignora NULLs e converte qualquer tipo de coluna para
-			// texto, evitando erro de cast no Postgres. O pro_codigo aparece de
-			// novo, sozinho, no segundo LIKE: dentro do concat_ws ele fica
-			// colado no vizinho e casa pelo mesmo LIKE frouxo que casa qualquer
-			// ano; testá-lo à parte deixa o casamento por código explícito.
-			//
-			// Os dois lados do UNION consomem o MESMO $n — é o mesmo termo.
-			filtrosCarros = append(filtrosCarros, fmt.Sprintf(
-				`(UPPER(concat_ws(' ', %s)) LIKE $%d
-				OR UPPER(COALESCE(CAST(pc.pro_codigo AS TEXT), '')) LIKE $%d)`,
-				colunasCarros, paramIndex, paramIndex))
+		for g, grupo := range grupos {
+			var ouCarros, ouProducts []string
 
-			filtrosProducts = append(filtrosProducts, fmt.Sprintf(
-				`(UPPER(concat_ws(' ', %s)) LIKE $%d
-				OR UPPER(COALESCE(CAST(p.pro_codigo AS TEXT), '')) LIKE $%d)`,
-				colunasProducts, paramIndex, paramIndex))
+			for _, forma := range grupo.Formas {
+				// concat_ws ignora NULLs e converte qualquer tipo de coluna
+				// para texto, evitando erro de cast no Postgres.
+				//
+				// Os dois lados do UNION consomem o MESMO $n — é a mesma forma.
+				c := registrar(forma, false)
+				ouCarros = append(ouCarros,
+					c.sql(fmt.Sprintf(`UPPER(concat_ws(' ', %s))`, colunasCarros)))
+				ouProducts = append(ouProducts,
+					c.sql(fmt.Sprintf(`UPPER(concat_ws(' ', %s))`, colunasProducts)))
+				contemPorGrupo[g] = append(contemPorGrupo[g], c)
+			}
 
-			params = append(params, "%"+termo+"%")
+			// O pro_codigo aparece de novo, sozinho, pela palavra COMO FOI
+			// DIGITADA (não pelas formas expandidas — código não se abrevia):
+			// dentro do concat_ws ele fica colado no vizinho e casa pelo mesmo
+			// LIKE frouxo que casa qualquer ano; testá-lo à parte deixa o
+			// casamento por código explícito.
+			ouCarros = append(ouCarros, fmt.Sprintf(
+				`UPPER(COALESCE(CAST(pc.pro_codigo AS TEXT), '')) LIKE $%d`, paramIndex))
+			ouProducts = append(ouProducts, fmt.Sprintf(
+				`UPPER(COALESCE(CAST(p.pro_codigo AS TEXT), '')) LIKE $%d`, paramIndex))
+			params = append(params, "%"+grupo.Original+"%")
 			paramIndex++
+
+			filtrosCarros = append(filtrosCarros, "("+strings.Join(ouCarros, " OR ")+")")
+			filtrosProducts = append(filtrosProducts, "("+strings.Join(ouProducts, " OR ")+")")
 		}
 
 		condCarros = strings.Join(filtrosCarros, " AND ")
@@ -289,34 +360,61 @@ func SearchProdutosCarros(db *sql.DB, search string, limit int) ([]map[string]in
 				END,
 				`+ordemPorCodigo, idxExato, idxPrefixo, idxContem)
 
+	case len(grupos) == 0:
+		// Só caracteres que a normalização descarta: nada para ranquear.
+
 	default:
 		/*
 		   Busca textual: o que o comprador digitou vem primeiro, medido sobre a
 		   DESCRIÇÃO, que é o que aparece na tela.
-		     0 — a descrição COMEÇA com o termo inteiro ("P/BRISA GOL")
-		     1 — a descrição CONTÉM o termo, mas não começa ("COLA DE P/BRISA")
+		     0 — a descrição COMEÇA pela primeira palavra e CONTÉM todas as
+		         outras ("P/BRISA GOL G5" para "parabrisa gol")
+		     1 — a descrição contém todas as palavras, mas não começa pela
+		         primeira ("BORRACHA P/BRISA GOL")
 		     2 — casou por outra coluna: código, referência, marca ou carro/ano
 
-		   O termo aqui é a busca INTEIRA, não cada palavra: quem digita
-		   "p/brisa gol" quer o para-brisa do Gol no topo, e ranquear por palavra
-		   solta ("gol") jogaria qualquer peça de Gol para a frente.
+		   Medido pelas FORMAS de cada grupo, não pelo texto digitado: quem
+		   digita "parabrisa gol" quer "P/BRISA GOL" no topo, e a descrição
+		   nunca começa por "PARABRISA". Exige todas as palavras, não só a
+		   primeira: ranquear pela primeira sozinha jogaria qualquer "P/BRISA"
+		   para a frente de "P/BRISA GOL".
 		*/
-		idxPrefixo := paramIndex
-		params = append(params, termoInteiro+"%")
-		paramIndex++
+		descricao := `UPPER(COALESCE(pro_descricao, ''))`
 
-		idxContem := paramIndex
-		params = append(params, "%"+termoInteiro+"%")
-		paramIndex++
+		var comecaPrimeira []string
+		for _, forma := range grupos[0].Formas {
+			comecaPrimeira = append(comecaPrimeira, registrar(forma, true).sql(descricao))
+		}
+
+		// `%forma%` já está nos parâmetros do WHERE: reaproveita os índices.
+		contemGrupo := func(g int) string {
+			var ou []string
+			for _, c := range contemPorGrupo[g] {
+				ou = append(ou, c.sql(descricao))
+			}
+			return "(" + strings.Join(ou, " OR ") + ")"
+		}
+
+		contemTodas := make([]string, 0, len(grupos))
+		for g := range grupos {
+			contemTodas = append(contemTodas, contemGrupo(g))
+		}
+		contemDemais := []string{"TRUE"}
+		if len(grupos) > 1 {
+			contemDemais = contemTodas[1:]
+		}
 
 		ordenacao = fmt.Sprintf(`
 				CASE
-					WHEN UPPER(COALESCE(pro_descricao, '')) LIKE $%d THEN 0
-					WHEN UPPER(COALESCE(pro_descricao, '')) LIKE $%d THEN 1
+					WHEN (%s) AND %s THEN 0
+					WHEN %s THEN 1
 					ELSE 2
 				END,
 				pro_descricao ASC,
-				`+ordemPorCodigo, idxPrefixo, idxContem)
+				`+ordemPorCodigo,
+			strings.Join(comecaPrimeira, " OR "),
+			strings.Join(contemDemais, " AND "),
+			strings.Join(contemTodas, " AND "))
 	}
 
 	idxLimite := paramIndex

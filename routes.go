@@ -71,6 +71,25 @@ func setupRoutes(router *gin.Engine, db *sql.DB, searchMode string) {
 		performSearchProdutosCarros(c, db, req, searchMode)
 	})
 
+	/*
+	   Como o serviço entendeu a busca — para conferir o dicionário sem olhar
+	   resultado de produto: `GET /api/interpretar?q=p/brisa gol` devolve os
+	   grupos ([PARA-BRISA] [GOL]) e as formas que cada um procura no banco.
+	*/
+	router.GET("/api/interpretar", func(c *gin.Context) {
+		q := c.Query("q")
+		if strings.TrimSpace(q) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Query parameter 'q' is required"})
+			return
+		}
+		grupos := dicionario.Interpretar(q)
+		c.JSON(http.StatusOK, gin.H{
+			"query":    q,
+			"grupos":   grupos,
+			"canonico": dicionario.Canonizar(q),
+		})
+	})
+
 	// Listar todos os produtos
 	router.GET("/api/products", func(c *gin.Context) {
 		limit := 100

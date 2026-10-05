@@ -29,6 +29,9 @@ WORKDIR /root/
 COPY --from=builder /app/smart-search-service .
 COPY --from=builder /app/.env.example .env
 COPY --from=builder /app/dev.db ./dev.db
+# Dicionário de abreviações (ver abreviacoes.go). Sem ele o serviço sobe com
+# o dicionário embutido, que é bem menor.
+COPY --from=builder "/app/Abreviações.xlsx" ./Abreviações.xlsx
 
 EXPOSE 8080
 

@@ -45,6 +45,22 @@ func main() {
 	}
 	log.Printf("Search mode: %s", searchMode)
 
+	/*
+	   Dicionário de abreviações (ver `abreviacoes.go`).
+
+	   Sem o arquivo o serviço sobe mesmo assim, com o dicionário embutido:
+	   a busca fica menos esperta, não fora do ar — e o log diz o porquê.
+	*/
+	caminhoAbreviacoes := os.Getenv("ABREVIACOES_PATH")
+	if caminhoAbreviacoes == "" {
+		caminhoAbreviacoes = "Abreviações.xlsx"
+	}
+	if d, err := CarregarAbreviacoes(caminhoAbreviacoes); err != nil {
+		log.Printf("[ABREVIACOES] %v — seguindo só com o dicionário embutido", err)
+	} else {
+		dicionario = d
+	}
+
 	// Inicializa banco de dados
 	db, err := InitializeDB(dbPath)
 	if err != nil {
